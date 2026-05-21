@@ -181,6 +181,60 @@ def assign_etdrs_subfield(
     return out
 
 
+def build_layered_mesh(
+    base_mesh: trimesh.Trimesh,
+    layer_thicknesses_um,
+    layer_names,
+) -> dict[str, trimesh.Trimesh]:
+    """Stack one offset surface per retinal layer above a base cap.
+
+    Each layer's surface is the base mesh displaced in **+Z** by the *cumulative*
+    thickness of all layers down to and including that one. Surfaces reuse the
+    base connectivity (faces), so they are conformal copies shifted in z; the
+    first layer's surface is the base + its own thickness (its outer boundary),
+    the next is that + the next thickness, and so on.
+
+    Parameters
+    ----------
+    base_mesh : trimesh.Trimesh with ``N = 1 + R*C`` vertices -- a
+        ``build_retinal_cap_mesh`` cap of resolution ``n_radial=R``,
+        ``n_angular=C`` (vertex 0 is the fovea).
+    layer_thicknesses_um : sequence of 2D arrays (one per layer), each of shape
+        ``(n_radial, n_angular)`` giving a thickness in microns per ring vertex;
+        row = ring (inner->outer), column = angle. The central vertex takes the
+        innermost ring's mean. Uniform layers are just constant arrays.
+    layer_names : sequence of layer names, same length/order as the thicknesses.
+
+    Returns
+    -------
+    dict ``{layer_name: trimesh.Trimesh}`` in the given order; each mesh is that
+    layer's cumulative offset (outer-boundary) surface.
+    """
+    if len(layer_thicknesses_um) != len(layer_names):
+        raise ValueError("layer_thicknesses_um and layer_names must have equal length.")
+    base_v = np.asarray(base_mesh.vertices, dtype=float)
+    faces = np.asarray(base_mesh.faces)
+    n = len(base_v)
+
+    cum_mm = np.zeros(n)        # cumulative offset per vertex, in mm
+    layers: dict[str, trimesh.Trimesh] = {}
+    for name, t2d in zip(layer_names, layer_thicknesses_um):
+        t2d = np.asarray(t2d, dtype=float)
+        if t2d.ndim != 2 or 1 + t2d.shape[0] * t2d.shape[1] != n:
+            raise ValueError(
+                f"thickness for {name!r} has shape {t2d.shape}; expected a 2D array "
+                f"with 1 + rows*cols == {n} (= base-mesh vertex count)."
+            )
+        per_vertex = np.empty(n)
+        per_vertex[0] = float(t2d[0].mean())   # fovea / central vertex
+        per_vertex[1:] = t2d.reshape(-1)        # ring-major == vertex order
+        cum_mm = cum_mm + per_vertex / 1000.0   # microns -> mm, accumulate
+        v = base_v.copy()
+        v[:, 2] += cum_mm
+        layers[name] = trimesh.Trimesh(vertices=v, faces=faces, process=False)
+    return layers
+
+
 def _print_stats(mesh: trimesh.Trimesh) -> None:
     """Print a compact summary of a cap mesh."""
     _, counts = np.unique(mesh.edges_sorted, axis=0, return_counts=True)

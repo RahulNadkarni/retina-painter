@@ -21,7 +21,7 @@ models/octolyzer_cache/
 # Generated artifacts (regenerable from the pipeline)
 *.blend
 *.blend1
-blender/retinal_cap.obj
+blender/*.obj
 blender/*.png
 notebooks/*.png
 notebooks/*.h5

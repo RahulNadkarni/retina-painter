@@ -2,7 +2,11 @@
 import numpy as np
 import pytest
 
-from src.geometry import assign_etdrs_subfield, build_retinal_cap_mesh
+from src.geometry import (
+    assign_etdrs_subfield,
+    build_layered_mesh,
+    build_retinal_cap_mesh,
+)
 
 # Small mesh keeps exact counts easy to reason about; defaults exercised too.
 N_RADIAL, N_ANGULAR = 8, 12
@@ -122,3 +126,30 @@ def test_laterality_default_and_validation():
         assign_etdrs_subfield(pts, laterality="left")
     with pytest.raises(TypeError):  # laterality is keyword-only
         assign_etdrs_subfield(pts, (0.0, 0.0), (0.5, 1.5, 3.0), "OS")
+
+
+# --- build_layered_mesh -------------------------------------------------------
+def test_build_layered_mesh_offsets():
+    nr, na = 8, 12
+    base = build_retinal_cap_mesh(n_radial=nr, n_angular=na)
+    names = ["RNFL", "GCL+IPL"]
+    thick = [np.full((nr, na), 40.0), np.full((nr, na), 80.0)]  # microns
+    layers = build_layered_mesh(base, thick, names)
+
+    assert list(layers) == names                      # keys, in order
+    bv = np.asarray(base.vertices)
+    for name in names:
+        m = layers[name]
+        assert len(m.vertices) == len(bv) and len(m.faces) == len(base.faces)
+        assert np.allclose(m.vertices[:, :2], bv[:, :2])   # x, y unchanged
+    # cumulative +Z offset: 40 um, then 40+80 = 120 um (-> mm)
+    assert np.allclose(layers["RNFL"].vertices[:, 2], bv[:, 2] + 0.040)
+    assert np.allclose(layers["GCL+IPL"].vertices[:, 2], bv[:, 2] + 0.120)
+
+
+def test_build_layered_mesh_validation():
+    base = build_retinal_cap_mesh(n_radial=8, n_angular=12)
+    with pytest.raises(ValueError):           # mismatched lengths
+        build_layered_mesh(base, [np.full((8, 12), 1.0)], ["a", "b"])
+    with pytest.raises(ValueError):           # wrong thickness shape
+        build_layered_mesh(base, [np.full((5, 5), 1.0)], ["a"])

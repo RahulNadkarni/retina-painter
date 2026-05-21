@@ -1,25 +1,36 @@
-"""Render the retinal cap coloured by an ETDRS subfield CSV, with a colorbar.
+"""Render the retinal cap coloured by ETDRS values, with a colorbar.
 
 Run via Blender:
 
+    # single layer painted on the base cap
     blender --background --python render.py -- \
-        --input values.csv --layer RNFL --output out.png --colormap viridis
+        --mode single --input values.csv --layer RNFL --output out.png --colormap viridis
 
-Pipeline:
-  1. Parse CLI args (after the ``--`` separator Blender uses for script args).
+    # all layer_*.obj surfaces stacked, each its own colormap, semi-transparent
+    blender --background --python render.py -- \
+        --mode layered --input values.csv --output out.png --alpha 0.5
+
+Pipeline (both modes):
+  1. Parse CLI args (after Blender's ``--`` separator).
   2. Open ``retinal_template.blend`` (camera / lights / Cycles set up already).
   3. Read the CSV (rows = layer names, columns = the 9 ETDRS subfields).
-  4. For the requested layer, label every vertex by ETDRS subfield, look up the
-     subfield value, and bake it to a vertex-colour attribute via `--colormap`
-     normalised over the layer's own (vmin, vmax). An emission material + the
-     Standard view transform make the rendered colours match the colormap.
-  5. Render with Cycles, then composite a matplotlib colorbar over the image.
+  4. Colour vertices by subfield value through a colormap, normalised over a
+     (vmin, vmax) auto-computed from each layer. Colours are baked to a
+     vertex-colour attribute; an emission shader + the Standard view transform
+     make rendered colours match the colormap.
+       - single  : paint one CSV layer onto the base cap.
+       - layered : import every ``blender/layer_*.obj`` offset surface, give each
+                   its own colormap, and a Transparent-BSDF mix (per-layer alpha)
+                   so the underlying layers show through.
+  5. Render with Cycles (256 samples in layered mode), then composite a
+     matplotlib colorbar (one per layer in layered mode).
   6. Save the final PNG to ``--output``.
 
-matplotlib must be installed in Blender's bundled Python (numpy already is).
+matplotlib must be importable in Blender's bundled Python.
 """
 import argparse
 import csv
+import glob
 import sys
 import tempfile
 from pathlib import Path
@@ -50,37 +61,44 @@ SUBFIELDS = (
 )
 COLOR_ATTR = "etdrs_value"
 
+# Distinct sequential colormaps assigned to layers in CSV order (layered mode).
+LAYER_CMAPS = ["Blues", "Greens", "Oranges", "Reds", "Purples", "YlOrBr", "PuBuGn", "RdPu"]
+
 
 # --- CLI ----------------------------------------------------------------------
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     p = argparse.ArgumentParser(description="Render the retinal cap coloured by an ETDRS CSV.")
+    p.add_argument("--mode", choices=["single", "layered"], default="single")
     p.add_argument("--input", required=True, help="CSV: rows=layers, cols=9 subfields")
-    p.add_argument("--layer", required=True, help="layer (CSV row) to render")
+    p.add_argument("--layer", default=None, help="layer to render (required for --mode single)")
     p.add_argument("--output", required=True, help="output PNG path")
-    p.add_argument("--colormap", default="viridis", help="matplotlib colormap name")
+    p.add_argument("--colormap", default="viridis", help="matplotlib colormap (single mode)")
+    p.add_argument("--alpha", type=float, default=0.5, help="per-layer opacity (layered mode)")
+    p.add_argument("--samples", type=int, default=0, help="Cycles samples (0 = mode default)")
     p.add_argument("--laterality", default="OD", choices=["OD", "OS"])
     return p.parse_args(argv)
 
 
 # --- CSV -----------------------------------------------------------------------
-def read_layer_values(csv_path, layer):
-    """Return the layer's 9 subfield values in canonical order."""
+def read_table(csv_path):
+    """Return an ordered dict {layer: [9 subfield values in canonical order]}."""
     with open(csv_path, newline="") as f:
         rows = [r for r in csv.reader(f) if r and any(c.strip() for c in r)]
     if not rows:
         raise ValueError(f"Empty CSV: {csv_path}")
     header = [h.strip().lower() for h in rows[0][1:]]
-    table = {r[0].strip(): [float(x) for x in r[1:]] for r in rows[1:]}
-    if layer not in table:
-        raise ValueError(f"Layer {layer!r} not in CSV. Available: {list(table)}")
-    vals = table[layer]
-    # If the header names the subfields, reorder to canonical; else assume order.
-    if all(name in header for name in SUBFIELDS):
-        return [vals[header.index(name)] for name in SUBFIELDS]
-    if len(vals) < 9:
-        raise ValueError(f"Layer {layer!r} has {len(vals)} columns; need 9 subfields.")
-    return vals[:9]
+    named = all(name in header for name in SUBFIELDS)
+    table = {}
+    for r in rows[1:]:
+        vals = [float(x) for x in r[1:]]
+        if named:
+            table[r[0].strip()] = [vals[header.index(name)] for name in SUBFIELDS]
+        else:
+            if len(vals) < 9:
+                raise ValueError(f"Layer {r[0]!r} has {len(vals)} columns; need 9.")
+            table[r[0].strip()] = vals[:9]
+    return table
 
 
 # --- geometry: ETDRS subfield per vertex (matches src.geometry) ---------------
@@ -107,7 +125,16 @@ def srgb_to_linear(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
-# --- scene setup --------------------------------------------------------------
+# --- mesh helpers -------------------------------------------------------------
+def import_obj(path):
+    before = set(bpy.data.objects)
+    bpy.ops.wm.obj_import(filepath=str(path), up_axis="Z", forward_axis="Y")
+    new = [o for o in bpy.data.objects if o not in before and o.type == "MESH"]
+    if not new:
+        raise RuntimeError(f"No mesh imported from {path}")
+    return new[0]
+
+
 def get_cap_object():
     meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
     if not meshes:
@@ -116,6 +143,11 @@ def get_cap_object():
         if "retinal_cap" in o.name.lower():
             return o
     return meshes[0]
+
+
+def remove_meshes():
+    for o in [o for o in bpy.context.scene.objects if o.type == "MESH"]:
+        bpy.data.objects.remove(o, do_unlink=True)
 
 
 def bake_vertex_colors(obj, values, cmap_name, laterality):
@@ -127,7 +159,6 @@ def bake_vertex_colors(obj, values, cmap_name, laterality):
     co = np.empty(n * 3, dtype=np.float64)
     mesh.vertices.foreach_get("co", co)
     co = co.reshape(n, 3)
-    # to world space (use x, y for the en-face subfield assignment)
     mw = np.array(obj.matrix_world)
     world = np.column_stack([co, np.ones(n)]) @ mw.T
     sub = vertex_subfields(world[:, 0], world[:, 1], laterality=laterality)
@@ -138,11 +169,10 @@ def bake_vertex_colors(obj, values, cmap_name, laterality):
     cmap = matplotlib.colormaps[cmap_name]
 
     per_vertex_val = np.where(sub >= 0, values[np.clip(sub, 0, 8)], np.nan)
-    rgba = cmap(norm(per_vertex_val))             # (n, 4) sRGB-ish
-    rgba[sub < 0] = (0.5, 0.5, 0.5, 1.0)          # outside grid -> neutral grey
-    rgba[:, :3] = srgb_to_linear(rgba[:, :3])     # store linear for faithful output
+    rgba = cmap(norm(per_vertex_val))
+    rgba[sub < 0] = (0.5, 0.5, 0.5, 1.0)
+    rgba[:, :3] = srgb_to_linear(rgba[:, :3])
 
-    # write a per-point FLOAT_COLOR attribute
     if COLOR_ATTR in mesh.color_attributes:
         mesh.color_attributes.remove(mesh.color_attributes[COLOR_ATTR])
     attr = mesh.color_attributes.new(name=COLOR_ATTR, type="FLOAT_COLOR", domain="POINT")
@@ -151,7 +181,15 @@ def bake_vertex_colors(obj, values, cmap_name, laterality):
     return vmin, vmax
 
 
+def _color_attr_node(nt):
+    attr = nt.nodes.new("ShaderNodeAttribute")
+    attr.attribute_type = "GEOMETRY"
+    attr.attribute_name = COLOR_ATTR
+    return attr
+
+
 def make_emission_material(obj):
+    """Opaque emission of the vertex colour (single mode)."""
     mat = bpy.data.materials.new("etdrs_emission")
     if mat.node_tree is None:   # use_nodes is deprecated to touch in Blender 5+
         mat.use_nodes = True
@@ -159,24 +197,43 @@ def make_emission_material(obj):
     nt.nodes.clear()
     out = nt.nodes.new("ShaderNodeOutputMaterial")
     emis = nt.nodes.new("ShaderNodeEmission")
-    attr = nt.nodes.new("ShaderNodeAttribute")
-    attr.attribute_type = "GEOMETRY"
-    attr.attribute_name = COLOR_ATTR
-    nt.links.new(attr.outputs["Color"], emis.inputs["Color"])
+    nt.links.new(_color_attr_node(nt).outputs["Color"], emis.inputs["Color"])
     nt.links.new(emis.outputs["Emission"], out.inputs["Surface"])
     obj.data.materials.clear()
     obj.data.materials.append(mat)
 
 
-def render_to(path):
+def make_transparent_material(obj, alpha, name):
+    """Mix(Transparent BSDF, Emission) so layers below show through (layered mode)."""
+    mat = bpy.data.materials.new(name)
+    if mat.node_tree is None:
+        mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    transp = nt.nodes.new("ShaderNodeBsdfTransparent")
+    emis = nt.nodes.new("ShaderNodeEmission")
+    nt.links.new(_color_attr_node(nt).outputs["Color"], emis.inputs["Color"])
+    mix.inputs["Fac"].default_value = float(alpha)   # 0 -> transparent, 1 -> emission
+    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(emis.outputs["Emission"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+
+
+def render_to(path, samples=0):
     scene = bpy.context.scene
-    # Standard view transform so emission colours match the colormap exactly.
-    scene.view_settings.view_transform = "Standard"
+    scene.view_settings.view_transform = "Standard"   # faithful colormap colours
+    if samples > 0:
+        scene.cycles.samples = samples
     scene.render.image_settings.file_format = "PNG"
     scene.render.filepath = str(path)
     bpy.ops.render.render(write_still=True)
 
 
+# --- colorbar compositing -----------------------------------------------------
 def composite_colorbar(render_png, out_png, cmap_name, vmin, vmax, label):
     import matplotlib
     matplotlib.use("Agg")
@@ -188,16 +245,92 @@ def composite_colorbar(render_png, out_png, cmap_name, vmin, vmax, label):
     h, w = img.shape[:2]
     fig = plt.figure(figsize=(w / 100, h / 100), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1]); ax.imshow(img); ax.axis("off")
-
     cax = fig.add_axes([0.905, 0.12, 0.018, 0.76])
-    sm = ScalarMappable(norm=Normalize(vmin, vmax), cmap=cmap_name)
-    cb = fig.colorbar(sm, cax=cax)
+    cb = fig.colorbar(ScalarMappable(norm=Normalize(vmin, vmax), cmap=cmap_name), cax=cax)
     cb.set_label(label, color="white", fontsize=13)
     cb.outline.set_edgecolor("white")
     cax.tick_params(color="white", labelcolor="white", labelsize=11)
+    fig.savefig(str(out_png), dpi=100); plt.close(fig)
 
-    fig.savefig(str(out_png), dpi=100)
-    plt.close(fig)
+
+def composite_multi_colorbar(render_png, out_png, specs):
+    """specs: list of (layer_name, cmap_name, vmin, vmax) -> stacked mini colorbars."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    img = plt.imread(str(render_png))
+    h, w = img.shape[:2]
+    fig = plt.figure(figsize=(w / 100, h / 100), dpi=100)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.imshow(img); ax.axis("off")
+
+    n = len(specs)
+    top, bottom = 0.94, 0.06
+    slot = (top - bottom) / max(n, 1)
+    barx, barw = 0.845, 0.13
+    for k, (name, cmap_name, vmin, vmax) in enumerate(specs):
+        by = top - (k + 1) * slot + slot * 0.40
+        cax = fig.add_axes([barx, by, barw, slot * 0.20])
+        cb = fig.colorbar(ScalarMappable(norm=Normalize(vmin, vmax), cmap=cmap_name),
+                          cax=cax, orientation="horizontal")
+        cb.set_ticks([vmin, vmax])
+        cb.outline.set_edgecolor("white")
+        cax.tick_params(color="white", labelcolor="white", labelsize=7, pad=1)
+        fig.text(barx, by + slot * 0.26, f"{name}  (µm)", color="white",
+                 fontsize=9, fontweight="bold", va="bottom")
+    fig.savefig(str(out_png), dpi=100); plt.close(fig)
+
+
+# --- modes --------------------------------------------------------------------
+def run_single(args):
+    table = read_table(args.input)
+    if args.layer is None:
+        raise ValueError("--layer is required for --mode single.")
+    if args.layer not in table:
+        raise ValueError(f"Layer {args.layer!r} not in CSV. Available: {list(table)}")
+    values = table[args.layer]
+    obj = get_cap_object()
+    vmin, vmax = bake_vertex_colors(obj, values, args.colormap, args.laterality)
+    make_emission_material(obj)
+    print(f"[single] {args.layer}: {len(obj.data.vertices)} verts, '{args.colormap}', "
+          f"vmin={vmin:.2f}, vmax={vmax:.2f}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        render_png = Path(tmp) / "render.png"
+        render_to(render_png, samples=args.samples)
+        composite_colorbar(render_png, args.output, args.colormap, vmin, vmax,
+                            label=f"{args.layer} thickness (µm)")
+
+
+def run_layered(args):
+    table = read_table(args.input)
+    remove_meshes()   # drop the template's base cap; we stack the layer surfaces
+
+    specs = []
+    for i, (layer, values) in enumerate(table.items()):
+        obj_path = SCRIPT_DIR / f"layer_{layer.replace('/', '_')}.obj"
+        if not obj_path.exists():
+            print(f"[layered] skip {layer!r}: missing {obj_path.name}")
+            continue
+        obj = import_obj(obj_path)
+        obj.name = f"layer_{layer.replace('/', '_')}"
+        cmap = LAYER_CMAPS[i % len(LAYER_CMAPS)]
+        vmin, vmax = bake_vertex_colors(obj, values, cmap, args.laterality)
+        make_transparent_material(obj, args.alpha, name=f"mat_{obj.name}")
+        specs.append((layer, cmap, vmin, vmax))
+        print(f"[layered] {layer:9s} <- {obj_path.name}  cmap={cmap:8s} "
+              f"range=[{vmin:.0f},{vmax:.0f}]  alpha={args.alpha}")
+    if not specs:
+        raise RuntimeError("No layer_*.obj surfaces matched the CSV rows.")
+
+    samples = args.samples if args.samples > 0 else 256
+    with tempfile.TemporaryDirectory() as tmp:
+        render_png = Path(tmp) / "render.png"
+        render_to(render_png, samples=samples)
+        composite_multi_colorbar(render_png, args.output, specs)
+    print(f"[layered] {len(specs)} layers, {samples} samples")
 
 
 def main():
@@ -206,24 +339,14 @@ def main():
         raise FileNotFoundError(f"Template not found: {TEMPLATE}. Run setup_scene.py first.")
     bpy.ops.wm.open_mainfile(filepath=str(TEMPLATE))
 
-    values = read_layer_values(args.input, args.layer)
-    print(f"Layer {args.layer!r} subfield values (canonical order):")
-    for name, v in zip(SUBFIELDS, values):
-        print(f"  {name:16s} {v:7.2f}")
-
-    obj = get_cap_object()
-    vmin, vmax = bake_vertex_colors(obj, values, args.colormap, args.laterality)
-    make_emission_material(obj)
-    print(f"Coloured {len(obj.data.vertices)} vertices with '{args.colormap}' over "
-          f"vmin={vmin:.2f}, vmax={vmax:.2f}")
-
     out_png = Path(args.output)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        render_png = Path(tmp) / "render.png"
-        render_to(render_png)
-        composite_colorbar(render_png, out_png, args.colormap, vmin, vmax,
-                           label=f"{args.layer} thickness (µm)")
+    args.output = str(out_png)
+
+    if args.mode == "layered":
+        run_layered(args)
+    else:
+        run_single(args)
     print(f"Saved -> {out_png}")
 
 

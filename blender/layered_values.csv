@@ -1,0 +1,9 @@
+layer,central,inner_superior,inner_nasal,inner_inferior,inner_temporal,outer_superior,outer_nasal,outer_inferior,outer_temporal
+RNFL,18,38,45,37,30,50,62,48,38
+GCL+IPL,25,98,95,99,96,65,62,66,60
+INL,20,40,39,41,38,33,32,34,31
+OPL,22,34,33,35,32,28,27,29,26
+ONL,115,92,88,90,95,74,70,72,76
+IS/OS,86,82,80,81,83,78,77,79,80
+RPE,22,20,19,21,20,18,18,19,18
+choroid,260,245,232,240,250,215,195,208,222

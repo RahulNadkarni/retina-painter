@@ -1,0 +1,27 @@
+# OS / editor
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Large datasets (not versioned)
+data/
+*.tar
+*.rar
+
+# Vendored upstream clone (has its own git history)
+OCTolyzer/
+
+# Downloaded model checkpoints
+models/octolyzer_cache/
+
+# Generated artifacts (regenerable from the pipeline)
+*.blend
+*.blend1
+blender/retinal_cap.obj
+blender/*.png
+notebooks/*.png
+notebooks/*.h5

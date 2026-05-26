@@ -255,12 +255,17 @@ def plot_etdrs_bullseye(
     output_path=None,
     ring_diameters_mm: Sequence[float] = (1.0, 3.0, 6.0),
     units: str = "µm",
+    colorbar: bool = True,
+    show_title: bool = True,
 ):
     """Render the 9 ETDRS subfields as a bullseye, coloured by value.
 
     Modelled on matplotlib's left-ventricle bullseye example: a polar axes filled
     with ``pcolormesh`` wedges, segment outlines, per-segment value annotations
     and a colorbar. Saves to ``output_path`` if given; returns the Figure.
+
+    Set ``colorbar=False`` / ``show_title=False`` to omit them (e.g. when the
+    bullseye is one panel of a composite with its own shared colorbar/title).
     """
     import matplotlib.pyplot as plt
     from matplotlib import cm, colors
@@ -322,11 +327,13 @@ def plot_etdrs_bullseye(
     ax.set_xticks([]); ax.set_yticks([])
     ax.grid(False)
     ax.spines["polar"].set_visible(False)
-    ax.set_title(f"ETDRS subfields — {layer_name}", pad=18, fontsize=13)
+    if show_title:
+        ax.set_title(f"ETDRS subfields — {layer_name}", pad=18, fontsize=13)
 
-    cb = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap_obj), ax=ax,
-                      fraction=0.046, pad=0.10)
-    cb.set_label(f"thickness ({units})")
+    if colorbar:
+        cb = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap_obj), ax=ax,
+                          fraction=0.046, pad=0.10)
+        cb.set_label(f"thickness ({units})")
 
     fig.tight_layout()
     if output_path is not None:
